@@ -1,6 +1,6 @@
 {
   "name": "clawrtc",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Mine RTC tokens with your AI agent using Proof-of-Antiquity consensus. Coinbase wallet + x402 payments.",
   "keywords": [
     "clawrtc",
@@ -34,6 +34,6 @@
     "platforms": ["rustchain"],
     "author": "Elyan Labs",
     "homepage": "https://rustchain.org",
-    "version": "1.5.0"
+    "version": "1.6.0"
   }
 }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawrtc"
-version = "1.5.0"
+version = "1.6.0"
 description = "ClawRTC — Let your AI agent mine RTC tokens on any modern hardware. Built-in wallet, VM-penalized."
 readme = "README.md"
 license = {text = "MIT"}
