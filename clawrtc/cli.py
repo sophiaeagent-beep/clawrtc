@@ -791,6 +791,7 @@ def main():
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     p_install = sub.add_parser("install", help="Install miner and configure wallet")
