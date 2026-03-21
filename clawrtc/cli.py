@@ -32,7 +32,7 @@ import textwrap
 import time
 import json
 
-__version__ = "1.5.0"
+__version__ = "1.7.1"
 
 INSTALL_DIR = os.path.join(os.path.expanduser("~"), ".clawrtc")
 VENV_DIR = os.path.join(INSTALL_DIR, "venv")
@@ -495,6 +495,18 @@ def cmd_start(args):
     os.execvp(python_bin, [python_bin, miner_py] + (["--wallet", wallet] if wallet else []))
 
 
+def cmd_mine(args):
+    """Mine command — install wallet if needed, then start."""
+    if hasattr(args, 'wallet') and args.wallet:
+        install_args = argparse.Namespace(
+            wallet=args.wallet, dry_run=False, verify=False,
+            service=getattr(args, 'service', False),
+            no_service=False, yes=True
+        )
+        cmd_install(install_args)
+    cmd_start(args)
+
+
 def cmd_stop(args):
     """Stop the ClawRTC miner."""
     system = platform.system()
@@ -775,10 +787,211 @@ def cmd_uninstall(args):
     success("ClawRTC miner fully uninstalled — no files remain")
 
 
+def cmd_bcos(args):
+    """BCOS v2 — Blockchain Certified Open Source certification."""
+    action = getattr(args, "bcos_action", "scan")
+    target = getattr(args, "bcos_target", ".")
+    as_json = getattr(args, "bcos_json", False)
+
+    if action == "scan":
+        _bcos_scan(target, args.tier, args.reviewer, as_json)
+    elif action == "verify":
+        _bcos_verify(target)
+    elif action == "certify":
+        _bcos_certify(target, args.tier, args.reviewer, getattr(args, "sign", False))
+    else:
+        print(f"{RED}Unknown BCOS action: {action}{NC}")
+
+
+def _bcos_scan(path, tier, reviewer, as_json):
+    """Run BCOS engine scan on a local repository."""
+    # Try to import bundled engine, fall back to system
+    try:
+        bcos_engine_path = os.path.join(DATA_DIR, "bcos_engine.py")
+        if os.path.exists(bcos_engine_path):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("bcos_engine", bcos_engine_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            scan_repo = mod.scan_repo
+            _print_report = mod._print_report
+        else:
+            # Try system import
+            from bcos_engine import scan_repo, _print_report
+    except ImportError:
+        print(f"{RED}BCOS engine not found.{NC}")
+        print(f"Install: pip install clawrtc  (includes bundled engine)")
+        print(f"Or copy bcos_engine.py to {DATA_DIR}/")
+        return
+
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        print(f"{RED}Not a directory: {path}{NC}")
+        return
+
+    print(f"{CYAN}Running BCOS v2 scan on {path}...{NC}")
+    report = scan_repo(path, tier=tier, reviewer=reviewer)
+    _print_report(report, as_json=as_json)
+
+
+def _bcos_verify(cert_id):
+    """Verify a BCOS certificate against the on-chain record."""
+    import urllib.request
+    import ssl
+
+    if not cert_id.startswith("BCOS-"):
+        cert_id = f"BCOS-{cert_id}"
+
+    url = f"{NODE_URL}/bcos/verify/{cert_id}"
+    print(f"{CYAN}Verifying {cert_id}...{NC}")
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+
+        if not data.get("ok"):
+            print(f"{RED}Not found: {data.get('error', 'unknown')}{NC}")
+            return
+
+        verified = data.get("verified", False)
+        icon = f"{GREEN}VERIFIED{NC}" if verified else f"{RED}UNVERIFIED{NC}"
+
+        print()
+        print(f"  Certificate:  {BOLD}{data['cert_id']}{NC}")
+        print(f"  Status:       {icon}")
+        print(f"  Repository:   {data.get('repo', 'unknown')}")
+        print(f"  Commit:       {data.get('commit_sha', 'unknown')[:12]}")
+        print(f"  Tier:         {data.get('tier', '?')}")
+        print(f"  Trust Score:  {data.get('trust_score', 0)}/100")
+        print(f"  Reviewer:     {data.get('reviewer', 'none')}")
+        print(f"  Commitment:   {data.get('commitment_valid', False)}")
+        print(f"  Signature:    {data.get('signature_valid', 'n/a')}")
+        print(f"  Epoch:        {data.get('anchored_epoch', 'n/a')}")
+        print()
+        print(f"  {DIM}Badge: {data.get('badge_url', '')}{NC}")
+        print(f"  {DIM}PDF:   {data.get('pdf_url', '')}{NC}")
+        print()
+
+    except Exception as e:
+        print(f"{RED}Verification failed: {e}{NC}")
+        print(f"{DIM}Node URL: {url}{NC}")
+
+
+def _bcos_certify(path, tier, reviewer, sign):
+    """Scan + anchor on-chain + download PDF."""
+    import urllib.request
+    import ssl
+
+    # Step 1: Scan
+    try:
+        bcos_engine_path = os.path.join(DATA_DIR, "bcos_engine.py")
+        if os.path.exists(bcos_engine_path):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("bcos_engine", bcos_engine_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            scan_repo = mod.scan_repo
+            _print_report = mod._print_report
+        else:
+            from bcos_engine import scan_repo, _print_report
+    except ImportError:
+        print(f"{RED}BCOS engine not found.{NC}")
+        return
+
+    path = os.path.abspath(path)
+    print(f"{CYAN}Step 1/3: Scanning {path}...{NC}")
+    report = scan_repo(path, tier=tier, reviewer=reviewer)
+    _print_report(report, as_json=False)
+
+    cert_id = report.get("cert_id", "unknown")
+    score = report.get("trust_score", 0)
+
+    # Step 2: Anchor on-chain
+    print(f"{CYAN}Step 2/3: Anchoring {cert_id} on RustChain...{NC}")
+
+    # Read admin key from env or config
+    admin_key = os.environ.get("RC_ADMIN_KEY", "")
+    if not admin_key:
+        config_path = os.path.join(os.path.expanduser("~"), ".clawrtc", "admin_key")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                admin_key = f.read().strip()
+
+    if not admin_key:
+        print(f"{YELLOW}No admin key found. Set RC_ADMIN_KEY env var or create ~/.clawrtc/admin_key{NC}")
+        print(f"{YELLOW}Skipping on-chain anchoring. Report saved locally.{NC}")
+        # Save report locally
+        out_path = os.path.join(path, f"{cert_id}.json")
+        with open(out_path, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"{GREEN}Report saved: {out_path}{NC}")
+        return
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        payload = json.dumps(report).encode()
+        req = urllib.request.Request(
+            f"{NODE_URL}/bcos/attest",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Admin-Key": admin_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+
+        if data.get("ok"):
+            print(f"{GREEN}Anchored! Epoch: {data.get('anchored_epoch', 'n/a')}{NC}")
+            print(f"  Verify: {data.get('verify_url', '')}")
+            print(f"  Badge:  {data.get('badge_url', '')}")
+        else:
+            print(f"{RED}Anchor failed: {data.get('error', 'unknown')}{NC}")
+
+    except Exception as e:
+        print(f"{RED}Anchor failed: {e}{NC}")
+
+    # Step 3: Download PDF
+    print(f"{CYAN}Step 3/3: Generating certificate PDF...{NC}")
+    try:
+        pdf_url = f"{NODE_URL}/bcos/cert/{cert_id}.pdf"
+        req = urllib.request.Request(pdf_url)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            pdf_data = resp.read()
+
+        out_path = os.path.join(path, f"{cert_id}.pdf")
+        with open(out_path, "wb") as f:
+            f.write(pdf_data)
+        print(f"{GREEN}Certificate saved: {out_path} ({len(pdf_data)} bytes){NC}")
+
+    except Exception as e:
+        print(f"{YELLOW}PDF download failed (cert still anchored): {e}{NC}")
+
+    print()
+    print(f"{GREEN}BCOS certification complete!{NC}")
+    print(f"  Cert ID:     {BOLD}{cert_id}{NC}")
+    print(f"  Trust Score: {score}/100")
+    print(f"  Tier:        {tier}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="clawrtc",
         description="ClawRTC — Mine RTC tokens with your AI agent on real hardware",
+        allow_abbrev=False,
         epilog=textwrap.dedent("""\
             Your Claw agent earns RTC by proving it runs on real hardware.
             Modern x86/ARM gets 1x multiplier. VMs are detected and penalized.
@@ -791,7 +1004,8 @@ def main():
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--version", "-V", action="version",
+                        version=f"clawrtc {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     p_install = sub.add_parser("install", help="Install miner and configure wallet")
@@ -805,10 +1019,29 @@ def main():
     p_start = sub.add_parser("start", help="Start mining")
     p_start.add_argument("--service", action="store_true", help="Create background service for auto-restart")
 
+    p_mine = sub.add_parser("mine", help="Start mining (alias for 'start')")
+    p_mine.add_argument("--wallet", help="Wallet name (will install first if needed)")
+    p_mine.add_argument("--service", action="store_true", help="Create background service for auto-restart")
+
     sub.add_parser("stop", help="Stop mining")
     sub.add_parser("status", help="Check miner + network status + file hashes")
     sub.add_parser("logs", help="View miner output logs")
     sub.add_parser("uninstall", help="Remove miner and all files completely")
+
+    # BCOS v2: Blockchain Certified Open Source
+    p_bcos = sub.add_parser("bcos", help="BCOS certification (scan, verify, certify)")
+    p_bcos.add_argument("bcos_action", nargs="?", default="scan",
+                        choices=["scan", "verify", "certify"],
+                        help="BCOS action (default: scan)")
+    p_bcos.add_argument("bcos_target", nargs="?", default=".",
+                        help="Path to scan or cert_id to verify")
+    p_bcos.add_argument("--tier", default="L1", choices=["L0", "L1", "L2"],
+                        help="Certification tier (default: L1)")
+    p_bcos.add_argument("--reviewer", default="", help="Human reviewer name (required for L2)")
+    p_bcos.add_argument("--json", action="store_true", dest="bcos_json",
+                        help="Output raw JSON report")
+    p_bcos.add_argument("--sign", action="store_true",
+                        help="Sign attestation with Ed25519 wallet key (certify only)")
 
     p_wallet = sub.add_parser("wallet", help="Manage RTC wallet (create, show, export, coinbase)")
     p_wallet.add_argument("wallet_action", nargs="?", default="show",
@@ -830,11 +1063,13 @@ def main():
     commands = {
         "install": cmd_install,
         "start": cmd_start,
+        "mine": cmd_mine,
         "stop": cmd_stop,
         "status": cmd_status,
         "logs": cmd_logs,
         "uninstall": cmd_uninstall,
         "wallet": cmd_wallet,
+        "bcos": cmd_bcos,
     }
 
     if not args.command:
