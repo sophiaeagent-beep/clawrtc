@@ -1,374 +1,888 @@
 #!/usr/bin/env python3
 """
-RustChain Local Miner — ClawRTC
-Auto-detects hardware, runs fingerprint checks, earns RTC tokens.
-"""
-import os, sys, json, time, hashlib, uuid, requests, socket, subprocess, platform, statistics, re
-from datetime import datetime
+RustChain Windows Wallet Miner
+Full-featured wallet and miner for Windows
 
-# Import fingerprint checks (bundled alongside this file)
+Includes Zephyr (RandomX) dual-mining integration.
+See: https://github.com/Scottcjn/rustchain-bounties/issues/461
+"""
+
+import os
+import sys
+import time
+import json
+import hashlib
+import platform
+import threading
+import statistics
+import uuid
+import subprocess
+import re
 try:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tkinter as tk
+    from tkinter import ttk, messagebox, scrolledtext
+    TK_AVAILABLE = True
+    _TK_IMPORT_ERROR = ""
+except Exception as e:
+    TK_AVAILABLE = False
+    _TK_IMPORT_ERROR = str(e)
+    tk = None
+    ttk = None
+    messagebox = None
+    scrolledtext = None
+import requests
+from datetime import datetime
+from pathlib import Path
+import argparse
+
+# ── RIP-PoA hardware fingerprint module ──
+# Optional import — if absent the miner still runs, but the server enrolls
+# it at VM-tier weight (1e-9) for not submitting fingerprint data. This was
+# previously dropped in a refactor and produced silent earning regressions
+# for every v3.1.0/v3.1.1-bundled install. Restored 2026-05-28 for v3.1.2.
+try:
     from fingerprint_checks import validate_all_checks
     FINGERPRINT_AVAILABLE = True
-except ImportError:
+    _FP_IMPORT_ERROR = ""
+except Exception as e:
     FINGERPRINT_AVAILABLE = False
+    _FP_IMPORT_ERROR = str(e)
+    validate_all_checks = None
 
-NODE_URL = "https://bulbous-bouffant.metalseed.net"
-BLOCK_TIME = 600  # 10 minutes
+# ── Ed25519 signing (GPT-5.4 audit finding #2) ──
+# Optional: if miner_crypto.py + PyNaCl are available, sign attestations
+# with Ed25519 over the canonical JSON of the full payload. Server-side
+# verification accepts both this scheme and the legacy sha512 fallback
+# (see PR #6426). Without signing, attestations are vulnerable to
+# wallet-hijack via MITM — fingerprint validation still passes but the
+# server has no crypto binding between wallet field and sender.
+try:
+    from miner_crypto import get_or_create_keypair, sign_payload  # noqa: F401
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
 
-class LocalMiner:
-    def __init__(self, wallet=None):
-        self.node_url = NODE_URL
-        self.wallet = wallet or self._gen_wallet()
-        self.hw_info = {}
-        self.enrolled = False
-        self.attestation_valid_until = 0
-        self.last_entropy = {}
+# Shared pipe-message builder (PR #6839 review)
+try:
+    from miners.signing_helpers import build_pipe_sign_message
+    _SIGNING_HELPERS = True
+except ImportError:
+    try:
+        from signing_helpers import build_pipe_sign_message
+        _SIGNING_HELPERS = True
+    except ImportError:
+        _SIGNING_HELPERS = False
 
-        self.fingerprint_data = {}
+# Configuration
+RUSTCHAIN_API = "http://50.28.86.131:8088"
+WALLET_DIR = Path.home() / ".rustchain"
+CONFIG_FILE = WALLET_DIR / "config.json"
+WALLET_FILE = WALLET_DIR / "wallet.json"
 
-        print("="*70)
-        print("ClawRTC Miner — RustChain Network")
-        print("="*70)
-        print(f"Node: {self.node_url}")
-        print(f"Wallet: {self.wallet}")
-        print("="*70)
+# ---------------------------------------------------------------------------
+# Zephyr dual-mining configuration
+# Zephyr is a privacy coin using the RandomX algorithm (same as Monero).
+# Its daemon is 'zephyrd' and the standard JSON-RPC port is 17767.
+# XMRig is the most common miner used for RandomX coins including Zephyr.
+# ---------------------------------------------------------------------------
+ZEPHYR_PROCESS_NAMES = ["xmrig", "zephyrd"]
+ZEPHYR_RPC_URL       = "http://localhost:17767/json_rpc"
+ZEPHYR_RPC_TIMEOUT   = 5   # seconds — fast timeout so miner loop doesn't stall
 
-        # Run fingerprint checks on startup
-        if FINGERPRINT_AVAILABLE:
-            print("\nRunning hardware fingerprint checks...")
-            try:
-                all_passed, results = validate_all_checks(include_rom_check=False)
-                self.fingerprint_data = {
-                    "all_passed": all_passed,
-                    "checks": results
-                }
-                if all_passed:
-                    print("All fingerprint checks PASSED")
-                else:
-                    failed = [k for k, v in results.items() if not v.get("passed")]
-                    print(f"WARNING: Fingerprint checks failed: {failed}")
-            except Exception as e:
-                print(f"Fingerprint checks error: {e}")
-                self.fingerprint_data = {"all_passed": False, "error": str(e)}
+
+class RustChainWallet:
+    """Windows wallet for RustChain"""
+    def __init__(self):
+        self.wallet_dir = WALLET_DIR
+        self.wallet_dir.mkdir(exist_ok=True)
+        self.wallet_data = self.load_wallet()
+
+    def load_wallet(self):
+        """Load or create wallet"""
+        if WALLET_FILE.exists():
+            with open(WALLET_FILE, 'r') as f:
+                return json.load(f)
         else:
-            print("Fingerprint checks not available (fingerprint_checks.py not found)")
+            return self.create_new_wallet()
 
-    def _gen_wallet(self):
-        data = f"claw-{uuid.uuid4().hex}-{time.time()}"
-        return hashlib.sha256(data.encode()).hexdigest()[:38] + "RTC"
+    def create_new_wallet(self):
+        """Create new wallet with address"""
+        timestamp = str(int(time.time()))
+        random_data = os.urandom(32).hex()
+        wallet_seed = hashlib.sha256(f"{timestamp}{random_data}".encode()).hexdigest()
 
-    def _run_cmd(self, cmd):
+        wallet_data = {
+            "address": f"{wallet_seed[:40]}RTC",
+            "balance": 0.0,
+            "created": datetime.now().isoformat(),
+            "transactions": []
+        }
+
+        self.save_wallet(wallet_data)
+        return wallet_data
+
+    def save_wallet(self, wallet_data=None):
+        """Save wallet data"""
+        if wallet_data:
+            self.wallet_data = wallet_data
+        with open(WALLET_FILE, 'w') as f:
+            json.dump(self.wallet_data, f, indent=2)
+
+
+class RustChainMiner:
+    """
+    Mining engine for RustChain.
+
+    Supports optional Zephyr (RandomX) dual-mining: when xmrig or zephyrd is
+    detected running alongside the RustChain miner, a pow_proof block is
+    included in the attestation and header submissions. This qualifies the
+    miner for the PoW bonus multiplier on RTC rewards at zero additional
+    compute cost — the Zephyr miner retains 100% of its CPU for hashing.
+    """
+
+    def __init__(self, wallet_address):
+        self.wallet_address = wallet_address
+        self.mining = False
+        self.shares_submitted = 0
+        self.shares_accepted = 0
+        self.miner_id = f"windows_{hashlib.md5(wallet_address.encode()).hexdigest()[:8]}"
+        self.node_url = RUSTCHAIN_API
+        self.attestation_valid_until = 0
+        self.last_enroll = 0
+        self.enrolled = False
+        self.hw_info = self._get_hw_info()
+        self.last_entropy = {}
+        self.last_attestation_error = ""
+        # Surfaced fingerprint status — non-empty string means the miner is
+        # submitting NO fingerprint and will be enrolled at VM-tier weight
+        # (1e-9), i.e. earning ~zero. Shown loudly every attest cycle.
+        self.last_fingerprint_warning = ""
+
+        # Zephyr dual-mining state — detected once per attest() cycle
+        self._pow_proof = None
+
+        # Ed25519 keypair — generated/loaded once per install. Used to sign
+        # every attestation payload below. Stored in the OS keystore via
+        # miner_crypto.get_or_create_keypair() so reinstall preserves identity.
+        self.keypair = {}
+        self.public_key = ""
+        if CRYPTO_AVAILABLE:
+            self.keypair = get_or_create_keypair()
+            self.public_key = self.keypair.get("public_key", "")
+
+    # -----------------------------------------------------------------------
+    # ZEPHYR DUAL-MINING METHODS
+    # -----------------------------------------------------------------------
+
+    def _detect_zephyr_processes(self) -> dict:
+        """
+        Checks whether xmrig or zephyrd are currently running using psutil
+        if available, falling back to a platform-appropriate process list
+        command if psutil is not installed.
+
+        Returns a dict mapping each process name to True/False.
+        e.g. {"xmrig": True, "zephyrd": False}
+        """
+        found = {name: False for name in ZEPHYR_PROCESS_NAMES}
+
         try:
-            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, timeout=10, shell=True).stdout.strip()
-        except:
-            return ""
+            import psutil
+            for proc in psutil.process_iter(["name"]):
+                try:
+                    proc_name = proc.info["name"].lower()
+                    for target in ZEPHYR_PROCESS_NAMES:
+                        if target in proc_name:
+                            found[target] = True
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return found
+
+        except ImportError:
+            # psutil not available — fall back to tasklist on Windows
+            try:
+                creation_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                output = subprocess.check_output(
+                    ["tasklist", "/fo", "csv", "/nh"],
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creation_flag,
+                    timeout=5
+                ).decode("utf-8", "ignore").lower()
+                for target in ZEPHYR_PROCESS_NAMES:
+                    if target in output:
+                        found[target] = True
+            except Exception:
+                pass
+            return found
+
+    def _query_zephyr_rpc(self) -> dict | None:
+        """
+        Queries the local Zephyr node's JSON-RPC endpoint for 'get_info'.
+
+        Returns the result dict on success, None on any failure.
+        A short timeout is used deliberately — if the node isn't running or
+        reachable, we degrade gracefully rather than stalling the mine loop.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id":      1,
+            "method":  "get_info",
+            "params":  {}
+        }
+        try:
+            resp = requests.post(
+                ZEPHYR_RPC_URL,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=ZEPHYR_RPC_TIMEOUT
+            )
+            resp.raise_for_status()
+            rpc_resp = resp.json()
+            if "result" in rpc_resp and "error" not in rpc_resp:
+                return rpc_resp["result"]
+        except Exception:
+            pass
+        return None
+
+    def _build_pow_proof(self) -> dict | None:
+        """
+        Constructs a PoW proof block if Zephyr activity is detected.
+
+        Returns a dict suitable for inclusion in attestation and header
+        payloads, or None if no Zephyr activity is found. This is the value
+        submitted to the server's validate_pow_proof() endpoint to claim the
+        PoW bonus multiplier.
+
+        Schema:
+          {
+            "chain":        "zephyr",
+            "algorithm":    "randomx",
+            "processes":    {"xmrig": bool, "zephyrd": bool},
+            "node_height":  int | null,   # from local daemon RPC, if reachable
+            "node_version": str | null,
+            "timestamp":    int,          # Unix epoch at proof construction
+            "nonce":        str           # 8-char hex — binds proof to this cycle
+          }
+
+        If neither process is running, returns None immediately — no RPC
+        call is attempted and no proof is attached to the submission.
+        """
+        processes = self._detect_zephyr_processes()
+
+        if not any(processes.values()):
+            return None  # Zephyr not running — no proof, no bonus, no overhead
+
+        node_info = self._query_zephyr_rpc()   # None if daemon unreachable
+
+        return {
+            "chain":        "zephyr",
+            "algorithm":    "randomx",
+            "processes":    processes,
+            "node_height":  node_info.get("height")  if node_info else None,
+            "node_version": node_info.get("version") if node_info else None,
+            "timestamp":    int(time.time()),
+            "nonce":        os.urandom(4).hex()   # replay-attack mitigation
+        }
+
+    # -----------------------------------------------------------------------
+    # CORE MINING METHODS (original, with PoW proof integration)
+    # -----------------------------------------------------------------------
+
+    def start_mining(self, callback=None):
+        """Start mining process"""
+        self.mining = True
+        self.mining_thread = threading.Thread(target=self._mine_loop, args=(callback,))
+        self.mining_thread.daemon = True
+        self.mining_thread.start()
+
+    def stop_mining(self):
+        """Stop mining"""
+        self.mining = False
+
+    def _mine_loop(self, callback):
+        """Main mining loop"""
+        while self.mining:
+            try:
+                if not self._ensure_ready(callback):
+                    time.sleep(10)
+                    continue
+
+                self._emit_ready_status(callback)
+                eligible = self.check_eligibility()
+                if eligible:
+                    header = self.generate_header()
+                    success = self.submit_header(header)
+                    self.shares_submitted += 1
+                    if success:
+                        self.shares_accepted += 1
+                    if callback:
+                        callback({
+                            "type":      "share",
+                            "submitted": self.shares_submitted,
+                            "accepted":  self.shares_accepted,
+                            "success":   success
+                        })
+                time.sleep(10)
+            except Exception as e:
+                if callback:
+                    callback({"type": "error", "message": str(e)})
+                time.sleep(30)
+
+    def _ensure_ready(self, callback):
+        """Ensure we have a fresh attestation and current epoch enrollment."""
+        now = time.time()
+
+        if now >= self.attestation_valid_until - 60:
+            if not self.attest():
+                if callback:
+                    message = "Attestation failed"
+                    if self.last_attestation_error:
+                        message = f"{message}: {self.last_attestation_error}"
+                    callback({"type": "error", "message": message})
+                return False
+            if callback:
+                callback({
+                    "type": "attest",
+                    "message": "Attestation submitted",
+                    "miner_id": self.miner_id,
+                    "attestation_ttl_seconds": max(0, int(self.attestation_valid_until - time.time())),
+                })
+
+        if (now - self.last_enroll) > 3600 or not self.enrolled:
+            if not self.enroll():
+                if callback:
+                    callback({"type": "error", "message": "Epoch enrollment failed"})
+                return False
+            if callback:
+                callback({
+                    "type": "enroll",
+                    "message": "Epoch enrollment succeeded",
+                    "miner_id": self.miner_id,
+                    "last_enroll": int(self.last_enroll),
+                })
+
+        return True
+
+    def _emit_ready_status(self, callback):
+        if not callback:
+            return
+        callback({
+            "type": "status",
+            "message": "Miner ready",
+            "miner_id": self.miner_id,
+            "enrolled": self.enrolled,
+            "attestation_ttl_seconds": max(0, int(self.attestation_valid_until - time.time())),
+        })
 
     def _get_mac_addresses(self):
-        """Return list of real MAC addresses present on the system."""
-        macs = []
-        # Try `ip -o link`
+        macs = set()
+
         try:
-            output = subprocess.run(
-                ["ip", "-o", "link"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-            ).stdout.splitlines()
-            for line in output:
-                m = re.search(r"link/(?:ether|loopback)\s+([0-9a-f:]{17})", line, re.IGNORECASE)
-                if m:
-                    mac = m.group(1).lower()
-                    if mac != "00:00:00:00:00:00":
-                        macs.append(mac)
+            node_mac = uuid.getnode()
+            if node_mac:
+                mac = ":".join(f"{(node_mac >> ele) & 0xff:02x}" for ele in range(40, -1, -8))
+                macs.add(mac)
         except Exception:
             pass
 
-        # Fallback to ifconfig
-        if not macs:
-            try:
-                output = subprocess.run(
-                    ["ifconfig", "-a"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    timeout=5,
-                ).stdout.splitlines()
-                for line in output:
-                    m = re.search(r"(?:ether|HWaddr)\s+([0-9a-f:]{17})", line, re.IGNORECASE)
-                    if m:
-                        mac = m.group(1).lower()
-                        if mac != "00:00:00:00:00:00":
-                            macs.append(mac)
-            except Exception:
-                pass
+        creation_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            output = subprocess.check_output(
+                ["getmac", "/fo", "csv", "/nh"],
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flag
+            ).decode("utf-8", "ignore").splitlines()
+            for line in output:
+                m = re.search(r"([0-9A-Fa-f:-]{17})", line)
+                if m:
+                    mac = m.group(1).replace("-", ":").lower()
+                    if mac != "00:00:00:00:00:00":
+                        macs.add(mac)
+        except Exception:
+            pass
 
-        return macs or ["00:00:00:00:00:01"]
+        return list(macs) or ["00:00:00:00:00:01"]
 
-    def _collect_entropy(self, cycles: int = 48, inner_loop: int = 25000):
-        """
-        Collect simple timing entropy by measuring tight CPU loops.
-        Returns summary statistics the node can score.
-        """
+    def _get_hw_info(self):
+        return {
+            "platform": platform.system(),
+            "machine":  platform.machine(),
+            "model":    platform.machine() or "Windows-PC",
+            "hostname": platform.node(),
+            "family":   "Windows",
+            "arch":     platform.processor() or "x86_64",
+            "macs":     self._get_mac_addresses()
+        }
+
+    def _collect_entropy(self, cycles=48, inner=30000):
         samples = []
         for _ in range(cycles):
             start = time.perf_counter_ns()
             acc = 0
-            for j in range(inner_loop):
-                acc ^= (j * 31) & 0xFFFFFFFF
-            duration = time.perf_counter_ns() - start
-            samples.append(duration)
+            for j in range(inner):
+                acc ^= (j * 29) & 0xFFFFFFFF
+            samples.append(time.perf_counter_ns() - start)
 
         mean_ns = sum(samples) / len(samples)
         variance_ns = statistics.pvariance(samples) if len(samples) > 1 else 0.0
-
         return {
-            "mean_ns": mean_ns,
-            "variance_ns": variance_ns,
-            "min_ns": min(samples),
-            "max_ns": max(samples),
-            "sample_count": len(samples),
+            "mean_ns":       mean_ns,
+            "variance_ns":   variance_ns,
+            "min_ns":        min(samples),
+            "max_ns":        max(samples),
+            "sample_count":  len(samples),
             "samples_preview": samples[:12],
         }
 
-    def _detect_arch(self):
-        """Detect hardware architecture for RustChain multiplier classification."""
-        machine = platform.machine().lower()
-        cpu = self._run_cmd("lscpu | grep 'Model name' | cut -d: -f2 | xargs") or ""
-        cpu_lower = cpu.lower()
+    def _warn_fingerprint(self, message: str):
+        """Surface a fingerprint-degradation warning loudly.
 
-        if "ppc" in machine or "powerpc" in machine:
-            if "g5" in cpu_lower or "970" in cpu_lower:
-                return "x86", "g5"
-            elif "g4" in cpu_lower or "7450" in cpu_lower or "7447" in cpu_lower:
-                return "x86", "g4"
-            elif "g3" in cpu_lower or "750" in cpu_lower:
-                return "x86", "g3"
-            return "powerpc", "powerpc"
-        elif "arm" in machine or "aarch64" in machine:
-            if platform.system() == "Darwin":
-                brand = self._run_cmd("sysctl -n machdep.cpu.brand_string") or ""
-                if any(x in brand.lower() for x in ["m1", "m2", "m3", "m4"]):
-                    return "arm", "apple_silicon"
-            return "arm", "modern"
-        else:
-            if "core 2" in cpu_lower or "core2" in cpu_lower:
-                return "x86", "core2duo"
-            elif "pentium" in cpu_lower:
-                return "x86", "pentium4"
-            return "x86", "modern"
-
-    def _get_hw_info(self):
-        """Collect hardware info with auto-detection."""
-        family, arch = self._detect_arch()
-        hw = {
-            "platform": platform.system(),
-            "machine": platform.machine(),
-            "hostname": socket.gethostname(),
-            "family": family,
-            "arch": arch,
-        }
-
-        # Get CPU
-        cpu = self._run_cmd("lscpu | grep 'Model name' | cut -d: -f2 | xargs")
-        hw["cpu"] = cpu or "Unknown"
-
-        # Get cores
-        cores = self._run_cmd("nproc")
-        hw["cores"] = int(cores) if cores else 6
-
-        # Get memory
-        mem = self._run_cmd("free -g | grep Mem | awk '{print $2}'")
-        hw["memory_gb"] = int(mem) if mem else 32
-
-        # Get MACs (ensures PoA signal uses real hardware data)
-        macs = self._get_mac_addresses()
-        hw["macs"] = macs
-        hw["mac"] = macs[0]
-
-        self.hw_info = hw
-        return hw
+        Stores it for the GUI and prints it to stderr every attest cycle.
+        A miner submitting no fingerprint earns ~zero (server weight 1e-9),
+        so this fault is repeated each cycle on purpose rather than logged
+        once and forgotten — silent degradation is what cost miners days of
+        rewards under the v3.1.x regression.
+        """
+        self.last_fingerprint_warning = message
+        try:
+            print(f"[FINGERPRINT][WARN] {message}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
     def attest(self):
-        """Hardware attestation"""
-        print(f"\n🔐 [{datetime.now().strftime('%H:%M:%S')}] Attesting...")
+        """
+        Perform hardware attestation for PoA.
 
-        self._get_hw_info()
-
+        Extended for Zephyr dual-mining: if xmrig or zephyrd is detected,
+        a pow_proof block is built and included in the attestation payload.
+        This allows the /attest/submit endpoint's validate_pow_proof() to
+        apply the PoW bonus multiplier to this miner's RTC rewards.
+        """
         try:
-            # Get challenge
-            resp = requests.post(f"{self.node_url}/attest/challenge", json={}, timeout=10)
-            if resp.status_code != 200:
-                print(f"❌ Challenge failed: {resp.status_code}")
+            challenge_resp = requests.post(
+                f"{self.node_url}/attest/challenge", json={}, timeout=10
+            )
+            if challenge_resp.status_code != 200:
+                self.last_attestation_error = (
+                    f"challenge rejected: {self._response_diagnostic(challenge_resp)}"
+                )
                 return False
-
-            challenge = resp.json()
-            nonce = challenge.get("nonce")
-            print(f"✅ Got challenge nonce")
-
+            challenge = challenge_resp.json()
+            nonce = challenge.get("nonce") if isinstance(challenge, dict) else None
+            if not nonce:
+                self.last_attestation_error = (
+                    f"challenge rejected: {self._response_diagnostic(challenge_resp)}"
+                )
+                return False
         except Exception as e:
-            print(f"❌ Challenge error: {e}")
+            self.last_attestation_error = f"challenge request failed: {e}"
             return False
 
-        # Collect entropy just before signing the report
         entropy = self._collect_entropy()
         self.last_entropy = entropy
 
-        # Submit attestation
-        attestation = {
-            "miner": self.wallet,
-            "miner_id": f"claw-{self.hw_info['hostname']}",
+        # Build PoW proof — None if Zephyr not running (no overhead in that case)
+        self._pow_proof = self._build_pow_proof()
+
+        report_payload = {
             "nonce": nonce,
-            "report": {
-                "nonce": nonce,
-                "commitment": hashlib.sha256(
-                    (nonce + self.wallet + json.dumps(entropy, sort_keys=True)).encode()
-                ).hexdigest(),
-                "derived": entropy,
-                "entropy_score": entropy.get("variance_ns", 0.0)
-            },
-            "device": {
-                "family": self.hw_info["family"],
-                "arch": self.hw_info["arch"],
-                "model": self.hw_info.get("cpu", "Unknown"),
-                "cpu": self.hw_info["cpu"],
-                "cores": self.hw_info["cores"],
-                "memory_gb": self.hw_info["memory_gb"]
-            },
-            "signals": {
-                "macs": self.hw_info.get("macs", [self.hw_info["mac"]]),
-                "hostname": self.hw_info["hostname"]
-            },
-            "fingerprint": self.fingerprint_data if self.fingerprint_data else None
+            "commitment": hashlib.sha256(
+                (nonce + self.wallet_address + json.dumps(entropy, sort_keys=True)).encode()
+            ).hexdigest(),
+            "derived":       entropy,
+            "entropy_score": entropy.get("variance_ns", 0.0)
         }
 
-        try:
-            resp = requests.post(f"{self.node_url}/attest/submit",
-                               json=attestation, timeout=30)
-
-            if resp.status_code == 200:
-                result = resp.json()
-                if result.get("ok"):
-                    self.attestation_valid_until = time.time() + 580
-                    print(f"✅ Attestation accepted!")
-                    print(f"   CPU: {self.hw_info['cpu']}")
-                    print(f"   Arch: {self.hw_info['family']}/{self.hw_info['arch']}")
-                    fp_status = "PASSED" if self.fingerprint_data.get("all_passed") else "N/A"
-                    print(f"   Fingerprint: {fp_status}")
-                    return True
-                else:
-                    print(f"❌ Rejected: {result}")
-            else:
-                print(f"❌ HTTP {resp.status_code}: {resp.text[:200]}")
-
-        except Exception as e:
-            print(f"❌ Error: {e}")
-
-        return False
-
-    def enroll(self):
-        """Enroll in epoch"""
-        if time.time() >= self.attestation_valid_until:
-            print(f"📝 Attestation expired, re-attesting...")
-            if not self.attest():
-                return False
-
-        print(f"\n📝 [{datetime.now().strftime('%H:%M:%S')}] Enrolling...")
-
-        payload = {
-            "miner_pubkey": self.wallet,
-            "miner_id": f"claw-{self.hw_info['hostname']}",
+        attestation = {
+            "miner":    self.wallet_address,
+            "miner_id": self.miner_id,
+            "report":   report_payload,
             "device": {
                 "family": self.hw_info["family"],
-                "arch": self.hw_info["arch"]
+                "arch":   self.hw_info["arch"],
+                "model":  self.hw_info.get("model") or self.hw_info.get("machine"),
+                "cpu":    platform.processor(),
+                "cores":  os.cpu_count()
+            },
+            "signals": {
+                "macs":     self.hw_info["macs"],
+                "hostname": self.hw_info["hostname"]
             }
         }
 
-        try:
-            resp = requests.post(f"{self.node_url}/epoch/enroll",
-                                json=payload, timeout=30)
+        # ── RIP-PoA hardware fingerprint attestation ──
+        # Server gates reward weight on this block: miners that omit it are
+        # enrolled at VM-tier weight (1e-9). Real hardware passes all six
+        # checks. ROM check disabled — this is modern x86, not retro.
+        # MUST populate fingerprint BEFORE signing so the Ed25519 signature
+        # below covers the canonical JSON including this block.
+        if FINGERPRINT_AVAILABLE:
+            try:
+                fp_passed, fp_checks = validate_all_checks(include_rom_check=False)
+                attestation["fingerprint"] = {
+                    "all_passed": fp_passed,
+                    "checks":     fp_checks,
+                }
+                self.last_fingerprint_warning = ""
+            except Exception as e:
+                # Do NOT swallow: a runtime failure here means the miner
+                # submits no fingerprint and the server enrolls it at VM-tier
+                # weight (1e-9). Surface it instead of mining at ~zero blindly.
+                self._warn_fingerprint(
+                    f"fingerprint checks raised at runtime ({e}); submitting "
+                    f"NO fingerprint -> server weight 1e-9 (earning ~zero)"
+                )
+        else:
+            # No fingerprint module at all. This is the #1 silent earning
+            # regression: the miner runs, attests, and enrolls fine, but at
+            # VM-tier weight. Make it impossible to miss.
+            self._warn_fingerprint(
+                "fingerprint_checks NOT available -> submitting NO fingerprint "
+                "-> server weight 1e-9 (earning ~zero). Put fingerprint_checks.py "
+                "in the SAME folder as this miner. Import error: "
+                + (_FP_IMPORT_ERROR or "unknown")
+            )
 
-            if resp.status_code == 200:
-                result = resp.json()
-                if result.get("ok"):
-                    self.enrolled = True
-                    weight = result.get('weight', 1.0)
-                    print(f"✅ Enrolled!")
-                    print(f"   Epoch: {result.get('epoch')}")
-                    print(f"   Weight: {weight}x")
-                    return True
+        # Attach PoW proof if present — server ignores this field if absent,
+        # so existing attestation behaviour is fully preserved for non-Zephyr miners.
+        if self._pow_proof:
+            attestation["pow_proof"] = self._pow_proof
+
+        # ── Ed25519 signature ──
+        # Sign the pipe-delimited message that the node verifier reconstructs
+        # (miner_id|miner|nonce|commitment). Previous code signed the canonical
+        # JSON of the full attestation, but the server verifies the pipe-string,
+        # causing every signed attestation to fail with INVALID_SIGNATURE.
+        # See issue #6798.
+        if CRYPTO_AVAILABLE and self.keypair:
+            try:
+                if _SIGNING_HELPERS:
+                    sign_msg = build_pipe_sign_message(attestation)
                 else:
-                    print(f"❌ Failed: {result}")
-            else:
-                error_data = resp.json() if resp.headers.get('content-type') == 'application/json' else {}
-                print(f"❌ HTTP {resp.status_code}: {error_data.get('error', resp.text[:200])}")
+                    sign_msg = "{}|{}|{}|{}".format(
+                        attestation["miner_id"],
+                        attestation["miner"],
+                        attestation["nonce"],
+                        attestation["report"]["commitment"],
+                    ).encode("utf-8")
+                signature = sign_payload(sign_msg, self.keypair["private_key"])
+                attestation["signature"] = signature
+                attestation["public_key"] = self.public_key
+                attestation["signature_type"] = "ed25519"
+            except Exception:
+                pass  # Fall through unsigned; server accepts with warning
+        else:
+            # Legacy fallback — sha512 pseudo-signature. Server accepts but
+            # logs a warning. Real wallet-hijack protection requires PyNaCl.
+            msg = f"{nonce}:{self.miner_id}:{self.wallet_address}:{int(time.time())}"
+            attestation["signature"] = hashlib.sha512(msg.encode()).hexdigest()
+            attestation["signature_type"] = "sha512_legacy"
 
+        try:
+            resp = requests.post(
+                f"{self.node_url}/attest/submit", json=attestation, timeout=30
+            )
+            if resp.status_code == 200 and resp.json().get("ok"):
+                self.attestation_valid_until = time.time() + 580
+                self.last_attestation_error = ""
+                return True
+            self.last_attestation_error = f"submit rejected: {self._response_diagnostic(resp)}"
         except Exception as e:
-            print(f"❌ Error: {e}")
-
+            self.last_attestation_error = f"submit request failed: {e}"
         return False
 
-    def check_balance(self):
-        """Check balance"""
+    def _response_diagnostic(self, resp):
+        """Return a compact HTTP failure description for operator logs."""
+        parts = [f"HTTP {getattr(resp, 'status_code', 'unknown')}"]
         try:
-            resp = requests.get(f"{self.node_url}/balance/{self.wallet}", timeout=10)
-            if resp.status_code == 200:
-                result = resp.json()
-                balance = result.get('balance_rtc', 0)
-                print(f"\n💰 Balance: {balance} RTC")
-                return balance
-        except:
+            payload = resp.json()
+        except Exception:
+            payload = None
+
+        if isinstance(payload, dict):
+            for key in ("code", "error", "message"):
+                value = payload.get(key)
+                if value:
+                    parts.append(f"{key}={value}")
+        else:
+            text = (getattr(resp, "text", "") or "").strip()
+            if text:
+                parts.append(f"body={text[:240]}")
+
+        return " ".join(parts)
+
+    def enroll(self):
+        """Enroll the miner into the current epoch after attesting."""
+        # Fetch current epoch from server to construct signed enrollment.
+        # The server computes epoch from its own slot clock; we re-query to
+        # match. There's a small race if epoch rolls between our query and
+        # POST — server returns invalid_enrollment_signature in that case and
+        # the miner retries on next cycle (fine, enrollment runs ~per epoch).
+        current_epoch = None
+        try:
+            ep_resp = requests.get(f"{self.node_url}/epoch", timeout=10)
+            if ep_resp.ok:
+                current_epoch = ep_resp.json().get("epoch")
+        except Exception:
             pass
+
+        payload = {
+            "miner_pubkey": self.wallet_address,
+            "miner_id":     self.miner_id,
+            "device": {
+                "family": self.hw_info["family"],
+                "arch":   self.hw_info["arch"]
+            }
+        }
+
+        # Sign (miner_pubkey|miner_id|epoch) — server expects this exact
+        # 3-field MAC format at line 4155 of rustchain_v2_integrated_v2.2.1.
+        # Uses the SAME Ed25519 key stored during attestation, so server
+        # cross-checks the pubkey matches its miner_attest_recent record.
+        if CRYPTO_AVAILABLE and self.keypair and current_epoch is not None:
+            enroll_message = f"{self.wallet_address}|{self.miner_id}|{current_epoch}"
+            try:
+                payload["signature"] = sign_payload(
+                    enroll_message.encode(), self.keypair["private_key"]
+                )
+                payload["public_key"] = self.public_key
+            except Exception:
+                pass  # Best-effort; server still accepts unsigned with warning
+
+        try:
+            resp = requests.post(
+                f"{self.node_url}/epoch/enroll", json=payload, timeout=15
+            )
+            if resp.status_code == 200 and resp.json().get("ok"):
+                self.enrolled = True
+                self.last_enroll = time.time()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def check_eligibility(self):
+        """Check if eligible to mine"""
+        try:
+            response = requests.get(
+                f"{RUSTCHAIN_API}/lottery/eligibility?miner_id={self.miner_id}"
+            )
+            if response.ok:
+                return response.json().get("eligible", False)
+        except Exception:
+            pass
+        return False
+
+    def generate_header(self):
+        """
+        Generate mining header.
+
+        Extended for Zephyr dual-mining: the most recently built pow_proof
+        (from the last attest() cycle) is included when present. This binds
+        the PoW evidence to the specific header submission so the node can
+        correlate the attestation proof with the reward claim.
+        """
+        timestamp = int(time.time())
+        nonce     = os.urandom(4).hex()
+        header    = {
+            "miner_id":  self.miner_id,
+            "wallet":    self.wallet_address,
+            "timestamp": timestamp,
+            "nonce":     nonce
+        }
+        header_str    = json.dumps(header, sort_keys=True)
+        header["hash"] = hashlib.sha256(header_str.encode()).hexdigest()
+
+        # Attach the cached PoW proof from the last attestation cycle.
+        # Using the cached value (rather than re-detecting on every header)
+        # avoids repeated process scans and RPC calls in the 10-second loop.
+        if self._pow_proof:
+            header["pow_proof"] = self._pow_proof
+
+        return header
+
+    def submit_header(self, header):
+        """Submit mining header"""
+        try:
+            response = requests.post(
+                f"{RUSTCHAIN_API}/headers/ingest_signed", json=header, timeout=5
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# GUI, headless runner, and entry point — unchanged from original
+# ---------------------------------------------------------------------------
+
+class RustChainGUI:
+    """Windows GUI for RustChain"""
+    def __init__(self):
+        if not TK_AVAILABLE:
+            raise RuntimeError(f"tkinter is not available: {_TK_IMPORT_ERROR}")
+        self.root = tk.Tk()
+        self.root.title("RustChain Wallet & Miner for Windows")
+        self.root.geometry("800x600")
+        self.wallet = RustChainWallet()
+        self.miner  = RustChainMiner(self.wallet.wallet_data["address"])
+        self.setup_gui()
+        self.update_stats()
+
+    def setup_gui(self):
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        wallet_frame = ttk.Frame(notebook)
+        notebook.add(wallet_frame, text="Wallet")
+        self.setup_wallet_tab(wallet_frame)
+
+        miner_frame = ttk.Frame(notebook)
+        notebook.add(miner_frame, text="Miner")
+        self.setup_miner_tab(miner_frame)
+
+    def setup_wallet_tab(self, parent):
+        info_frame = ttk.LabelFrame(parent, text="Wallet Information", padding=10)
+        info_frame.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(info_frame, text="Address:").grid(row=0, column=0, sticky="w")
+        self.address_label = ttk.Label(info_frame, text=self.wallet.wallet_data["address"])
+        self.address_label.grid(row=0, column=1, sticky="w")
+
+        ttk.Label(info_frame, text="Balance:").grid(row=1, column=0, sticky="w")
+        self.balance_label = ttk.Label(
+            info_frame, text=f"{self.wallet.wallet_data['balance']:.8f} RTC"
+        )
+        self.balance_label.grid(row=1, column=1, sticky="w")
+
+    def setup_miner_tab(self, parent):
+        control_frame = ttk.LabelFrame(parent, text="Mining Control", padding=10)
+        control_frame.pack(fill="x", padx=10, pady=10)
+
+        self.mine_button = ttk.Button(
+            control_frame, text="Start Mining", command=self.toggle_mining
+        )
+        self.mine_button.pack(pady=10)
+
+        stats_frame = ttk.LabelFrame(parent, text="Mining Statistics", padding=10)
+        stats_frame.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(stats_frame, text="Shares Submitted:").grid(row=0, column=0, sticky="w")
+        self.shares_label = ttk.Label(stats_frame, text="0")
+        self.shares_label.grid(row=0, column=1, sticky="w")
+
+        ttk.Label(stats_frame, text="Shares Accepted:").grid(row=1, column=0, sticky="w")
+        self.accepted_label = ttk.Label(stats_frame, text="0")
+        self.accepted_label.grid(row=1, column=1, sticky="w")
+
+    def toggle_mining(self):
+        if self.miner.mining:
+            self.miner.stop_mining()
+            self.mine_button.config(text="Start Mining")
+        else:
+            self.miner.start_mining(self.mining_callback)
+            self.mine_button.config(text="Stop Mining")
+
+    def mining_callback(self, data):
+        if data["type"] == "share":
+            self.update_mining_stats()
+
+    def update_mining_stats(self):
+        self.shares_label.config(text=str(self.miner.shares_submitted))
+        self.accepted_label.config(text=str(self.miner.shares_accepted))
+
+    def update_stats(self):
+        if self.miner.mining:
+            self.update_mining_stats()
+        self.root.after(5000, self.update_stats)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def _format_headless_event(evt):
+    t = evt.get("type")
+    if t == "share":
+        ok = "OK" if evt.get("success") else "FAIL"
+        return (
+            f"[share] submitted={evt.get('submitted')} "
+            f"accepted={evt.get('accepted')} {ok}"
+        )
+    if t == "attest":
+        return (
+            f"[attest] {evt.get('message')} "
+            f"miner_id={evt.get('miner_id')} "
+            f"ttl={evt.get('attestation_ttl_seconds')}s"
+        )
+    if t == "enroll":
+        return f"[enroll] {evt.get('message')} miner_id={evt.get('miner_id')}"
+    if t == "status":
+        enrolled = "yes" if evt.get("enrolled") else "no"
+        return (
+            f"[status] {evt.get('message')} "
+            f"miner_id={evt.get('miner_id')} "
+            f"enrolled={enrolled} "
+            f"attest_ttl={evt.get('attestation_ttl_seconds')}s"
+        )
+    if t == "error":
+        return f"[error] {evt.get('message')}"
+    return None
+
+
+def run_headless(wallet_address: str, node_url: str) -> int:
+    wallet = RustChainWallet()
+    active_wallet = wallet_address or wallet.wallet_data["address"]
+    miner = RustChainMiner(active_wallet)
+    miner.node_url = node_url
+
+    def cb(evt):
+        line = _format_headless_event(evt)
+        if not line:
+            return
+        if evt.get("type") == "error":
+            print(line, file=sys.stderr, flush=True)
+        else:
+            print(line, flush=True)
+
+    print("RustChain Windows miner: headless mode", flush=True)
+    print(f"node={miner.node_url} miner_id={miner.miner_id}", flush=True)
+    miner.start_mining(cb)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        miner.stop_mining()
+        print("\nStopping miner.", flush=True)
         return 0
 
-    def mine(self):
-        """Start mining"""
-        print(f"\n⛏️  Starting mining...")
-        print(f"Block time: {BLOCK_TIME//60} minutes")
-        print(f"Press Ctrl+C to stop\n")
 
-        # Save wallet
-        with open("/tmp/local_miner_wallet.txt", "w") as f:
-            f.write(self.wallet)
-        print(f"💾 Wallet saved to: /tmp/local_miner_wallet.txt\n")
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="RustChain Windows wallet + miner (GUI or headless fallback)."
+    )
+    ap.add_argument("--headless", action="store_true",
+                    help="Run without GUI (recommended for embeddable Python).")
+    ap.add_argument("--node",   default=RUSTCHAIN_API,
+                    help="RustChain node base URL.")
+    ap.add_argument("--wallet", default="",
+                    help="Wallet address / miner pubkey string.")
+    args = ap.parse_args(argv)
 
-        cycle = 0
+    if args.headless or not TK_AVAILABLE:
+        if not TK_AVAILABLE and not args.headless:
+            print(
+                f"tkinter unavailable ({_TK_IMPORT_ERROR}); falling back to --headless.",
+                file=sys.stderr
+            )
+        return run_headless(args.wallet, args.node)
 
-        try:
-            while True:
-                cycle += 1
-                print(f"\n{'='*70}")
-                print(f"Cycle #{cycle} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"{'='*70}")
+    app = RustChainGUI()
+    app.miner.node_url = args.node
+    if args.wallet:
+        app.miner.wallet_address = args.wallet
+        app.miner.miner_id = f"windows_{hashlib.md5(args.wallet.encode()).hexdigest()[:8]}"
+    app.run()
+    return 0
 
-                if self.enroll():
-                    print(f"⏳ Mining for {BLOCK_TIME//60} minutes...")
-
-                    for i in range(BLOCK_TIME // 30):
-                        time.sleep(30)
-                        elapsed = (i + 1) * 30
-                        remaining = BLOCK_TIME - elapsed
-                        print(f"   ⏱️  {elapsed}s elapsed, {remaining}s remaining...")
-
-                    self.check_balance()
-
-                else:
-                    print("❌ Enrollment failed. Retrying in 60s...")
-                    time.sleep(60)
-
-        except KeyboardInterrupt:
-            print(f"\n\n⛔ Mining stopped")
-            print(f"   Wallet: {self.wallet}")
-            self.check_balance()
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--wallet", help="Wallet address")
-    args = parser.parse_args()
-
-    miner = LocalMiner(wallet=args.wallet)
-    miner.mine()
+    raise SystemExit(main())
