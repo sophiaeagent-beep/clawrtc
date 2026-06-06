@@ -64,6 +64,25 @@ def success(msg):
     print(f"{GREEN}[OK]{NC} {msg}")
 
 
+def _safe_print(text):
+    """Print text, falling back when legacy consoles cannot encode it."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        try:
+            safe_text = text.encode(encoding, errors="replace").decode(
+                encoding,
+                errors="replace",
+            )
+        except LookupError:
+            safe_text = text.encode("utf-8", errors="replace").decode(
+                "utf-8",
+                errors="replace",
+            )
+        print(safe_text)
+
+
 def warn(msg):
     print(f"{YELLOW}[WARN]{NC} {msg}")
 
@@ -678,7 +697,7 @@ def _wallet_create(args):
     with open(os.path.join(INSTALL_DIR, ".wallet"), "w") as f:
         f.write(address)
 
-    print(textwrap.dedent(f"""
+    _safe_print(textwrap.dedent(f"""
     {GREEN}{BOLD}═══════════════════════════════════════════════════════════
       RTC WALLET CREATED
     ═══════════════════════════════════════════════════════════{NC}
