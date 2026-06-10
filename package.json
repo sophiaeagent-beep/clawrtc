@@ -1,7 +1,7 @@
 {
   "name": "clawrtc",
-  "version": "1.6.0",
-  "description": "Mine RTC tokens with your AI agent using Proof-of-Antiquity consensus. Coinbase wallet + x402 payments.",
+  "version": "1.8.0",
+  "description": "Mine RTC tokens with v3.1.1 hardware fingerprint + Ed25519 signing. VM-penalized.",
   "keywords": [
     "clawrtc",
     "openclaw",
@@ -31,9 +31,11 @@
     "name": "clawrtc",
     "description": "Mine RTC tokens with Proof-of-Antiquity hardware fingerprinting",
     "invocation": "/clawrtc",
-    "platforms": ["rustchain"],
+    "platforms": [
+      "rustchain"
+    ],
     "author": "Elyan Labs",
     "homepage": "https://rustchain.org",
-    "version": "1.6.0"
+    "version": "1.8.0"
   }
 }

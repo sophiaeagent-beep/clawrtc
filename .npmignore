@@ -1,0 +1,15 @@
+# Build/cache artifacts — never ship in the npm package
+__pycache__/
+*.pyc
+*.pyo
+
+# Backup files (e.g. miner.py.bak-v3.1.1-broken-*) — keep local, never distribute.
+# Shipping a known-broken miner backup risks reintroducing the 1e-9 fingerprint regression.
+*.bak
+*.bak-*
+
+# Python packaging byproducts (irrelevant to the npm package)
+*.egg-info/
+build/
+dist/
+.pytest_cache/
