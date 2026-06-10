@@ -32,7 +32,7 @@ import textwrap
 import time
 import json
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 INSTALL_DIR = os.path.join(os.path.expanduser("~"), ".clawrtc")
 VENV_DIR = os.path.join(INSTALL_DIR, "venv")

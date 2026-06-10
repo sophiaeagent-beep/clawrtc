@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawrtc"
-version = "1.8.0"
-description = "ClawRTC — Mine RTC tokens + BCOS code certification. Built-in wallet, VM-penalized."
+version = "1.9.0"
+description = "ClawRTC — Mine AND spend RTC: wallet, pay/tip/gas/settle, BCOS certification. VM-penalized."
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Elyan Labs", email = "scott@elyanlabs.ai"}]

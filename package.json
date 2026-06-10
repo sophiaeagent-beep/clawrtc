@@ -1,6 +1,6 @@
 {
   "name": "clawrtc",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Mine RTC tokens with v3.1.1 hardware fingerprint + Ed25519 signing. VM-penalized.",
   "keywords": [
     "clawrtc",
@@ -36,6 +36,6 @@
     ],
     "author": "Elyan Labs",
     "homepage": "https://rustchain.org",
-    "version": "1.8.0"
+    "version": "1.9.0"
   }
 }
