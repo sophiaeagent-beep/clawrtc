@@ -1,0 +1,30 @@
+name: Publish to npm (Trusted Publishing)
+
+# Trusted Publishing (OIDC): no npm tokens, no 2FA fights, nothing to expire.
+# One-time setup on npmjs.com (logged in as sophiaagent):
+#   Package "clawrtc" -> Settings -> Trusted Publisher -> GitHub Actions
+#   Organization/user: sophiaeagent-beep   Repository: clawrtc
+#   Workflow filename: npm-publish.yml
+# After that: pushing a v* tag (or Run workflow button) publishes.
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write   # OIDC token for npm trusted publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing requires npm >= 11.5.1
+      - run: npm install -g npm@latest
+      - run: npm publish --access public
