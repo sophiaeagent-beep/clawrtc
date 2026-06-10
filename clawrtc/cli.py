@@ -1058,6 +1058,10 @@ def main():
     p_wallet.add_argument("--public-only", action="store_true",
                           help="Export without private key (export only)")
 
+    # Spend-side verbs (pay / tip / gas / settle) — the other half of the faucet.
+    from clawrtc.spend import add_spend_parsers
+    add_spend_parsers(sub)
+
     args = parser.parse_args()
 
     commands = {
@@ -1076,7 +1080,8 @@ def main():
         parser.print_help()
         return
 
-    func = commands.get(args.command)
+    # Spend verbs attach their handler via set_defaults(func=...); prefer it.
+    func = getattr(args, "func", None) or commands.get(args.command)
     if func:
         func(args)
     else:
